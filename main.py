@@ -1,326 +1,345 @@
-import cv2
-import numpy as np
+"""
+Vehicle Detection, Tracking, Counting & Speed Estimation
+---------------------------------------------------------
+Uses YOLOv8 for detection + Ultralytics' built-in ByteTrack for
+multi-object tracking (replaces a hand-rolled centroid tracker).
+
+NOTE on estimates: AQI and speed values here are heuristic proxies for
+demo purposes, not calibrated physical measurements. See README notes
+in estimate_aqi() and CalibrationConfig for what would be needed to
+make them accurate (camera calibration / homography, real emissions
+factors, etc). Be upfront about this in an interview -- it's a design
+choice, not an oversight, as long as you can explain it.
+"""
+
 import os
 import math
-import time
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-import threading
-from collections import deque
-from matplotlib.ticker import MultipleLocator
+import argparse
+from dataclasses import dataclass, field
 
-# YOLOv8 import
+import cv2
+import matplotlib.pyplot as plt
 from ultralytics import YOLO
 
-plt.ion()
-fig, ax = plt.subplots()
-bars = ax.bar(['Cars', 'Trucks', 'Up', 'Down'], [0, 0, 0, 0])
-ax.set_ylim(0, 10)
-ax.yaxis.set_major_locator(plt.MultipleLocator(2))  # Adjust as per expected range
 
-# -------------------- CAR CLASS --------------------
-class Car:
-    def __init__(self, i, xi, yi, max_age):
-        self.i = i
-        self.x = xi
-        self.y = yi
-        self.tracks = []
-        self.done = False
-        self.state = '0'
-        self.age = 0
-        self.max_age = max_age
-        self.dir = None
-        self.frames_crossed = 0
-        self.cross_start_frame = None
-        self.cross_end_frame = None
+# ============================================================
+# CONFIG
+# ============================================================
 
-    def getId(self):
-        return self.i
+@dataclass
+class Config:
+    video_path: str = "Vehicle-Detection-Classification-and-Counting-main/Videos/video.mp4"
+    model_weights: str = "yolov8n.pt"
+    frame_size: tuple = (900, 500)
+    conf_threshold: float = 0.3
+    vehicle_classes: tuple = (2, 7)  # COCO: 2=car, 7=truck
+    class_labels: dict = field(default_factory=lambda: {2: "Car", 7: "Truck"})
 
-    def getState(self):
-        return self.state
+    # Counting lines (pixel y-coordinates in the resized frame)
+    line_up: int = 400
+    line_down: int = 250
 
-    def getDir(self):
-        return self.dir
+    # Calibration: real-world distance between the two lines.
+    # This is a rough estimate unless you've measured it against the
+    # actual road/camera geometry. State this assumption out loud.
+    real_distance_meters: float = 8.0
+    speed_limit_kmh: float = 100.0
 
-    def getX(self):
-        return self.x
+    output_dir: str = "detected"
+    show_video: bool = True
 
-    def getY(self):
-        return self.y
 
-    def updateCoords(self, xn, yn):
-        self.age = 0
-        self.tracks.append([self.x, self.y])
-        self.x = xn
-        self.y = yn
-        self.frames_crossed += 1
+# ============================================================
+# EMISSIONS / AQI HEURISTIC
+# ============================================================
 
-    def setDone(self):
-        self.done = True
+def estimate_aqi(car_count: int, truck_count: int):
+    """
+    Rough proxy AQI based on a linear emissions-weight heuristic.
+    NOT a calibrated environmental model -- trucks are weighted ~7.5x
+    a car's emission factor, then scaled down and capped at 500 to
+    stay in a plausible AQI-like range. Good enough to demonstrate
+    trend/relative comparison across a video, not for real air-quality
+    reporting.
+    """
+    CAR_EMISSION_RATE = 120
+    TRUCK_EMISSION_RATE = 900
 
-    def timedOut(self):
-        return self.done
-
-    def going_UP(self, mid_start, mid_end):
-        if len(self.tracks) >= 2 and self.state == '0':
-            if self.tracks[-1][1] < mid_end and self.tracks[-2][1] >= mid_end:
-                self.state = '1'
-                self.dir = 'up'
-                return True
-        return False
-
-    def going_DOWN(self, mid_start, mid_end):
-        if len(self.tracks) >= 2 and self.state == '0':
-            if self.tracks[-1][1] > mid_start and self.tracks[-2][1] <= mid_start:
-                self.state = '1'
-                self.dir = 'down'
-                return True
-        return False
-
-    def age_one(self):
-        self.age += 1
-        if self.age > self.max_age:
-            self.done = True
-        return True
-
-# -------------------- VARIABLES --------------------
-os.makedirs('detected', exist_ok=True)
-
-cap = cv2.VideoCapture("Vehicle-Detection-Classification-and-Counting-main/Videos/video.mp4")
-
-# Load YOLOv8 model (will auto-download if not present)
-model = YOLO("yolov8n.pt")  # change to yolov8s.pt/m/l if you need accuracy/speed tradeoff
-
-fps = cap.get(cv2.CAP_PROP_FPS)
-frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-
-font = cv2.FONT_HERSHEY_SIMPLEX
-
-cars = []
-max_p_age = 5
-pid = 1
-
-cnt_up = 0
-cnt_down = 0
-cnt_car = 0
-cnt_truck = 0
-
-line_up = 400
-line_down = 250
-up_limit = 230
-down_limit = int(4.5 * (500 / 5))
-
-real_distance_meters = 8.0  # Estimated real-world distance between lines
-pixel_distance = abs(line_down - line_up)
-meters_per_pixel = real_distance_meters / pixel_distance
-speed_limit = 100
-speeds = {}
-overspeed_count = 0
-overspeeding_ids = []
-
-# -------------------- UTILS --------------------
-def euclidean_distance(x1, y1, x2, y2):
-    return math.hypot(x1 - x2, y1 - y2)
-
-def estimate_aqi(car_count, truck_count):
-    car_emission_rate = 120
-    truck_emission_rate = 900
-
-    total_car_emissions = car_count * car_emission_rate
-    total_truck_emissions = truck_count * truck_emission_rate
-    total_emissions = total_car_emissions + total_truck_emissions
-
+    total_emissions = car_count * CAR_EMISSION_RATE + truck_count * TRUCK_EMISSION_RATE
     aqi = min(int(total_emissions / 100), 500)
+
     if aqi < 50:
-        return (aqi, "Good")
+        category = "Good"
     elif aqi < 100:
-        return (aqi, "Moderate")
+        category = "Moderate"
     elif aqi < 150:
-        return (aqi, "Unhealthy for Sensitive Groups")
+        category = "Unhealthy for Sensitive Groups"
     elif aqi < 200:
-        return (aqi, "Unhealthy")
+        category = "Unhealthy"
     elif aqi < 300:
-        return (aqi, "Very Unhealthy")
+        category = "Very Unhealthy"
     else:
-        return (aqi, "Hazardous")
+        category = "Hazardous"
+    return aqi, category
 
-aqi_history = []
-frame_count = 0
 
-def update_live_graph(cnt_car, cnt_truck, cnt_up, cnt_down):
-    estimated_aqi, _ = estimate_aqi(cnt_car, cnt_truck)
-    aqi_history.append(estimated_aqi)
+# ============================================================
+# TRACK STATE
+# ============================================================
 
-    # Order: car, truck, up, down
-    values = [cnt_car, cnt_truck, cnt_up, cnt_down]
-    for bar, val in zip(bars, values):
-        bar.set_height(val)
+class TrackState:
+    """
+    Per-track bookkeeping keyed by the tracker's persistent track_id.
+    Replaces the old Car class + hasattr(car, 'counted') hack.
+    """
 
-    ax.set_ylim(0, 60)
-    fig.canvas.draw()
-    fig.canvas.flush_events()
+    def __init__(self, track_id: int, cy: int, frame_idx: int):
+        self.track_id = track_id
+        self.first_cy = cy
+        self.last_cy = cy
+        self.first_frame = frame_idx
+        self.last_frame = frame_idx
+        self.counted = False       # explicit flag, always initialized
+        self.direction = None      # 'up' | 'down'
+        self.label = None
+        self.speed_kmh = None
 
-# Separate AQI Line Graph Setup
-fig_aqi, ax_aqi = plt.subplots()
-x_data, y_data = [], []
-line_aqi, = ax_aqi.plot([], [], 'r-', label='AQI')
-ax_aqi.set_title("AQI Over Time")
-ax_aqi.set_xlabel("Frame Count")
-ax_aqi.set_ylabel("AQI")
-ax_aqi.set_ylim(0, 500)
-ax_aqi.legend()
-plt.ion()
-fig_aqi.show()
+    def update(self, cy: int, frame_idx: int):
+        self.last_cy = cy
+        self.last_frame = frame_idx
 
-# -------------------- MAIN LOOP --------------------
-frame_number = 0
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
-    frame_number += 1
-    frame = cv2.resize(frame, (900, 500))
 
-    # ---------------- YOLOv8 INFERENCE INSTEAD OF BACKGROUND SUBTRACTION ----------------
-    results = model(frame)[0]  # single-frame result
-    detected_centroids = []
+class VehicleCounter:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.tracks: dict[int, TrackState] = {}
+        self.cnt_up = 0
+        self.cnt_down = 0
+        self.cnt_car = 0
+        self.cnt_truck = 0
+        self.speeds: dict[int, float] = {}
+        self.overspeed_ids: list[int] = []
 
-    # COCO class ids: 2 = car, 7 = truck
-    for box in results.boxes:
-        cls_id = int(box.cls[0])
-        conf = float(box.conf[0])
-        if cls_id in [2, 7] and conf > 0.3:  # thresholding
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            w = x2 - x1
-            h = y2 - y1
-            cx = x1 + w // 2
-            cy = y1 + h // 2
-            label = "Car" if cls_id == 2 else "Truck"
-            detected_centroids.append((cx, cy, x1, y1, w, h, label, conf))
+        pixel_distance = abs(cfg.line_down - cfg.line_up)
+        self.meters_per_pixel = cfg.real_distance_meters / pixel_distance
+        self.pixel_distance = pixel_distance
 
-    # ------------------ TRACKING / MATCHING ------------------
-    for item in detected_centroids:
-        cx, cy, x, y, w, h, label, conf = item
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        cv2.putText(frame, f"{label} {conf:.2f}", (x, y - 5), font, 0.5, (255, 255, 0), 1)
+        os.makedirs(cfg.output_dir, exist_ok=True)
 
-        matched = False
-        for car in cars:
-            if euclidean_distance(cx, cy, car.getX(), car.getY()) < 50:
-                car.updateCoords(cx, cy)
-                matched = True
+    def _crossed_up(self, prev_cy, cur_cy):
+        # moving from below line_up to above it (y decreasing = "up" on screen)
+        return prev_cy >= self.cfg.line_up > cur_cy
 
-                if car.going_UP(line_down, line_up) and not hasattr(car, 'counted'):
-                    cnt_up += 1
-                    if label == "Car":
-                        cnt_car += 1
-                    else:
-                        cnt_truck += 1
-                    car.counted = True
+    def _crossed_down(self, prev_cy, cur_cy):
+        return prev_cy <= self.cfg.line_down < cur_cy
 
-                    time_seconds = car.frames_crossed / fps if fps > 0 else 1
-                    real_distance = pixel_distance * meters_per_pixel
-                    speed = (real_distance / time_seconds) * 3.6
-                    if 0 < speed < 180:
-                        speeds[car.getId()] = round(speed, 2)
-                        if speed > speed_limit:
-                            overspeed_count += 1
-                            overspeeding_ids.append(car.getId())
-                            vehicle_img = frame[y:y+h, x:x+w]
-                            filename = f"detected/overspeed_vehicle_{car.getId()}.jpg"
-                            cv2.imwrite(filename, vehicle_img)
+    def process_detection(self, track_id, cy, label, frame_idx, fps, frame, box):
+        state = self.tracks.get(track_id)
+        if state is None:
+            state = TrackState(track_id, cy, frame_idx)
+            state.label = label
+            self.tracks[track_id] = state
+            return
 
-                elif car.going_DOWN(line_down, line_up) and not hasattr(car, 'counted'):
-                    cnt_down += 1
-                    if label == "Car":
-                        cnt_car += 1
-                    else:
-                        cnt_truck += 1
-                    car.counted = True
+        prev_cy = state.last_cy
+        state.update(cy, frame_idx)
 
-                    time_seconds = car.frames_crossed / fps if fps > 0 else 1
-                    real_distance = pixel_distance * meters_per_pixel
-                    speed = (real_distance / time_seconds) * 3.6
-                    if 0 < speed < 180:
-                        speeds[car.getId()] = round(speed, 2)
-                        if speed > speed_limit:
-                            overspeed_count += 1
-                            overspeeding_ids.append(car.getId())
-                            vehicle_img = frame[y:y+h, x:x+w]
-                            filename = f"detected/overspeed_vehicle_{car.getId()}.jpg"
-                            cv2.imwrite(filename, vehicle_img)
+        if state.counted:
+            return  # already counted once, don't double count
+
+        crossed = None
+        if self._crossed_up(prev_cy, cy):
+            crossed = "up"
+        elif self._crossed_down(prev_cy, cy):
+            crossed = "down"
+
+        if crossed is None:
+            return
+
+        state.counted = True
+        state.direction = crossed
+        if crossed == "up":
+            self.cnt_up += 1
+        else:
+            self.cnt_down += 1
+
+        if label == "Car":
+            self.cnt_car += 1
+        else:
+            self.cnt_truck += 1
+
+        # ---- speed estimate ----
+        elapsed_frames = max(state.last_frame - state.first_frame, 1)
+        time_seconds = elapsed_frames / fps if fps > 0 else 1
+        real_distance = self.pixel_distance * self.meters_per_pixel
+        speed_kmh = (real_distance / time_seconds) * 3.6
+
+        if 0 < speed_kmh < 180:  # sanity clamp against tracker noise
+            state.speed_kmh = round(speed_kmh, 2)
+            self.speeds[track_id] = state.speed_kmh
+            if speed_kmh > self.cfg.speed_limit_kmh:
+                self.overspeed_ids.append(track_id)
+                x1, y1, x2, y2 = box
+                vehicle_img = frame[y1:y2, x1:x2]
+                if vehicle_img.size > 0:
+                    filename = os.path.join(
+                        self.cfg.output_dir, f"overspeed_vehicle_{track_id}.jpg"
+                    )
+                    cv2.imwrite(filename, vehicle_img)
+
+    def report(self):
+        total_vehicles = self.cnt_car + self.cnt_truck
+        aqi, category = estimate_aqi(self.cnt_car, self.cnt_truck)
+
+        print(f"Total vehicles detected: {self.cnt_up + self.cnt_down}")
+        print(f"Total overspeeding vehicles: {len(self.overspeed_ids)}")
+        print("\n--- Speeds (km/h) ---")
+        for vid, spd in self.speeds.items():
+            flag = " --> OVERSPEEDING" if spd > self.cfg.speed_limit_kmh else ""
+            print(f"Vehicle {vid}: {spd} km/h{flag}")
+        print(f"Overspeeding Vehicle IDs: {self.overspeed_ids}")
+        print(f"\nEstimated AQI: {aqi} ({category})")
+
+        with open("aqi_report.txt", "w") as f:
+            f.write(f"Total Vehicles: {total_vehicles}\n")
+            f.write(f"Estimated AQI: {aqi}\n")
+            f.write(f"Air Quality: {category}\n")
+            f.write(f"Total overspeeding vehicles: {len(self.overspeed_ids)}\n")
+            f.write(f"Overspeeding Vehicle IDs: {self.overspeed_ids}\n")
+        print("\nAQI report saved successfully!")
+
+        return total_vehicles, aqi, category
+
+
+# ============================================================
+# LIVE PLOTS
+# ============================================================
+
+class LiveGraphs:
+    def __init__(self):
+        plt.ion()
+        self.fig, self.ax = plt.subplots()
+        self.bars = self.ax.bar(["Cars", "Trucks", "Up", "Down"], [0, 0, 0, 0])
+        self.ax.set_ylim(0, 60)
+
+        self.fig_aqi, self.ax_aqi = plt.subplots()
+        self.x_data, self.y_data = [], []
+        (self.line_aqi,) = self.ax_aqi.plot([], [], "r-", label="AQI")
+        self.ax_aqi.set_title("AQI Over Time")
+        self.ax_aqi.set_xlabel("Frame Count")
+        self.ax_aqi.set_ylabel("AQI")
+        self.ax_aqi.set_ylim(0, 500)
+        self.ax_aqi.legend()
+
+    def update(self, cnt_car, cnt_truck, cnt_up, cnt_down, frame_idx):
+        for bar, val in zip(self.bars, [cnt_car, cnt_truck, cnt_up, cnt_down]):
+            bar.set_height(val)
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+
+        aqi, _ = estimate_aqi(cnt_car, cnt_truck)
+        self.x_data.append(frame_idx)
+        self.y_data.append(aqi)
+        self.line_aqi.set_data(self.x_data, self.y_data)
+        self.ax_aqi.set_xlim(0, max(50, len(self.x_data)))
+        self.ax_aqi.set_ylim(0, max(100, max(self.y_data) + 20))
+        self.fig_aqi.canvas.draw()
+        self.fig_aqi.canvas.flush_events()
+
+    def save(self):
+        self.fig.savefig("vehicle_count_bar_chart.png")
+        self.fig_aqi.savefig("aqi_over_time_line_graph.png")
+        print("Bar chart saved as 'vehicle_count_bar_chart.png'")
+        print("AQI line graph saved as 'aqi_over_time_line_graph.png'")
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+def run(cfg: Config):
+    cap = cv2.VideoCapture(cfg.video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Could not open video: {cfg.video_path}")
+
+    model = YOLO(cfg.model_weights)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    counter = VehicleCounter(cfg)
+    graphs = LiveGraphs()
+
+    frame_idx = 0
+    try:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
                 break
+            frame_idx += 1
+            frame = cv2.resize(frame, cfg.frame_size)
 
-        if not matched:
-            new_car = Car(pid, cx, cy, max_p_age)
-            cars.append(new_car)
-            pid += 1
+            # ByteTrack via Ultralytics: persist=True keeps IDs stable
+            # across frames instead of re-matching centroids by hand.
+            results = model.track(
+                frame,
+                persist=True,
+                classes=list(cfg.vehicle_classes),
+                conf=cfg.conf_threshold,
+                verbose=False,
+            )[0]
 
-    for car in cars[:]:
-        car.age_one()
-        if car.timedOut():
-            cars.remove(car)
+            if results.boxes is not None and results.boxes.id is not None:
+                boxes = results.boxes.xyxy.cpu().numpy()
+                cls_ids = results.boxes.cls.cpu().numpy()
+                track_ids = results.boxes.id.cpu().numpy().astype(int)
+                confs = results.boxes.conf.cpu().numpy()
 
-    # ------------------ DRAW LINES & INFO ------------------
-    frame = cv2.line(frame, (0, line_up), (900, line_up), (255, 0, 255), 2)
-    frame = cv2.line(frame, (0, up_limit), (900, up_limit), (0, 255, 255), 2)
-    frame = cv2.line(frame, (0, down_limit), (900, down_limit), (255, 0, 0), 2)
-    frame = cv2.line(frame, (0, line_down), (900, line_down), (255, 0, 0), 2)
+                for box, cls_id, track_id, conf in zip(boxes, cls_ids, track_ids, confs):
+                    x1, y1, x2, y2 = map(int, box)
+                    cy = (y1 + y2) // 2
+                    label = cfg.class_labels.get(int(cls_id), "Vehicle")
 
-    cv2.putText(frame, f'UP: {cnt_up}', (10, 40), font, 0.6, (0, 0, 255), 2)
-    cv2.putText(frame, f'DOWN: {cnt_down}', (10, 80), font, 0.6, (255, 0, 0), 2)
-    cv2.putText(frame, f'Cars: {cnt_car}', (10, 120), font, 0.6, (0, 255, 0), 2)
-    cv2.putText(frame, f'Trucks: {cnt_truck}', (10, 160), font, 0.6, (0, 255, 255), 2)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(
+                        frame, f"{label} #{track_id} {conf:.2f}",
+                        (x1, y1 - 5), font, 0.5, (255, 255, 0), 1,
+                    )
 
-    update_live_graph(cnt_car, cnt_truck, cnt_up, cnt_down)
+                    counter.process_detection(
+                        track_id, cy, label, frame_idx, fps, frame, (x1, y1, x2, y2)
+                    )
 
-    # Update AQI line graph
-    x_data.append(frame_count)
-    y_data.append(aqi_history[-1] if aqi_history else 0)
-    line_aqi.set_data(x_data, y_data)
-    ax_aqi.set_xlim(0, max(50, len(x_data)))
-    ax_aqi.set_ylim(0, max(100, max(y_data) + 20) if y_data else 500)
-    fig_aqi.canvas.draw()
-    fig_aqi.canvas.flush_events()
-    frame_count += 1
+            # ---- overlay lines & counts ----
+            w = cfg.frame_size[0]
+            cv2.line(frame, (0, cfg.line_up), (w, cfg.line_up), (255, 0, 255), 2)
+            cv2.line(frame, (0, cfg.line_down), (w, cfg.line_down), (255, 0, 0), 2)
+            cv2.putText(frame, f"UP: {counter.cnt_up}", (10, 40), font, 0.6, (0, 0, 255), 2)
+            cv2.putText(frame, f"DOWN: {counter.cnt_down}", (10, 80), font, 0.6, (255, 0, 0), 2)
+            cv2.putText(frame, f"Cars: {counter.cnt_car}", (10, 120), font, 0.6, (0, 255, 0), 2)
+            cv2.putText(frame, f"Trucks: {counter.cnt_truck}", (10, 160), font, 0.6, (0, 255, 255), 2)
 
-    cv2.imshow('Frame', frame)
-    if cv2.waitKey(1) & 0xFF == ord('h'):
-        break
+            graphs.update(counter.cnt_car, counter.cnt_truck, counter.cnt_up, counter.cnt_down, frame_idx)
 
-cap.release()
-# -------------------- SAVE GRAPHS --------------------
+            if cfg.show_video:
+                cv2.imshow("Frame", frame)
+                if cv2.waitKey(1) & 0xFF == ord("h"):
+                    break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        graphs.save()
+        counter.report()
 
-# Save the final bar chart as an image
-fig.savefig("vehicle_count_bar_chart.png")
-print("Bar chart saved as 'vehicle_count_bar_chart.png'")
 
-# Save the final AQI line graph as an image
-fig_aqi.savefig("aqi_over_time_line_graph.png")
-print("AQI line graph saved as 'aqi_over_time_line_graph.png'")
-cv2.destroyAllWindows()
+def parse_args():
+    p = argparse.ArgumentParser(description="Vehicle detection, tracking & counting")
+    p.add_argument("--video", default=Config.video_path, help="Path to input video")
+    p.add_argument("--weights", default=Config.model_weights, help="YOLO weights file")
+    p.add_argument("--no-display", action="store_true", help="Run headless (no cv2.imshow window)")
+    return p.parse_args()
 
-# -------------------- RESULTS --------------------
-total_vehicles = cnt_car + cnt_truck
-print(f"Total vehicles detected: {cnt_up + cnt_down}")
-print(f"Total overspeeding vehicles: {overspeed_count}")
-print("\n--- Speeds (km/h) ---")
-for vid, spd in speeds.items():
-    print(f"Vehicle {vid}: {spd} km/h")
-    if spd > speed_limit:
-        print(f"--> Vehicle {vid} was overspeeding!")
-print(f"Overspeeding Vehicle IDs: {overspeeding_ids}")
 
-estimated_aqi, air_quality = estimate_aqi(cnt_car, cnt_truck)
-print(f"\nEstimated AQI: {estimated_aqi}")
-print(f"Air Quality: {air_quality}")
-
-with open('aqi_report.txt', 'w') as f:
-    f.write(f"Total Vehicles: {total_vehicles}\n")
-    f.write(f"Estimated AQI: {estimated_aqi}\n")
-    f.write(f"Air Quality: {air_quality}\n")
-    f.write(f"Total overspeeding vehicles: {overspeed_count}\n")
-    f.write(f"Overspeeding Vehicle IDs: {overspeeding_ids}\n")
-
-print("\nAQI report saved successfully!")
+if __name__ == "__main__":
+    args = parse_args()
+    cfg = Config(video_path=args.video, model_weights=args.weights, show_video=not args.no_display)
+    run(cfg)
